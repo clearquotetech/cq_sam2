@@ -128,6 +128,53 @@ class SAM2ImagePredictor:
         self._is_image_set = True
         logging.info("Image embeddings computed.")
 
+
+    @torch.no_grad()
+    def get_features(
+        self,
+        image: Union[np.ndarray, Image],
+    ) -> None:
+        """
+        Calculates the image embeddings for the provided image, allowing
+        masks to be predicted with the 'predict' method.
+
+        Arguments:
+          image (np.ndarray or PIL Image): The input image to embed in RGB format. The image should be in HWC format if np.ndarray, or WHC format if PIL Image
+          with pixel values in [0, 255].
+          image_format (str): The color format of the image, in ['RGB', 'BGR'].
+        """
+        # Transform the image to the form expected by the model
+        if isinstance(image, np.ndarray):
+            logging.info("For numpy array image, we assume (HxWxC) format")
+            orig_hw = [image.shape[:2]]
+        elif isinstance(image, Image):
+            w, h = image.size
+            orig_hw = [(h, w)]
+        else:
+            raise NotImplementedError("Image format not supported")
+
+        input_image = self._transforms(image)
+        input_image = input_image[None, ...].to(self.device)
+
+        assert (
+            len(input_image.shape) == 4 and input_image.shape[1] == 3
+        ), f"input_image must be of size 1x3xHxW, got {input_image.shape}"
+        logging.info("Computing image embeddings for the provided image...")
+        backbone_out = self.model.forward_image(input_image)
+        _, vision_feats, _, _ = self.model._prepare_backbone_features(backbone_out)
+        # Add no_mem_embed, which is added to the lowest rest feat. map during training on videos
+        if self.model.directly_add_no_mem_embed:
+            vision_feats[-1] = vision_feats[-1] + self.model.no_mem_embed
+
+        feats = [
+            feat.permute(1, 2, 0).view(1, -1, *feat_size)
+            for feat, feat_size in zip(vision_feats[::-1], self._bb_feat_sizes[::-1])
+        ][::-1]
+        features = {"image_embed": feats[-1], "high_res_feats": feats[:-1]}
+        
+        logging.info("Image embeddings computed.")
+        return orig_hw, features
+
     @torch.no_grad()
     def set_image_batch(
         self,
@@ -343,6 +390,8 @@ class SAM2ImagePredictor:
         multimask_output: bool = True,
         return_logits: bool = False,
         img_idx: int = -1,
+        orig_hw = None,
+        features= None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Predict masks for the given input prompts, using the currently set image.
@@ -379,10 +428,11 @@ class SAM2ImagePredictor:
             of masks and H=W=256. These low res logits can be passed to
             a subsequent iteration as mask input.
         """
-        if not self._is_image_set:
-            raise RuntimeError(
-                "An image must be set with .set_image(...) before mask prediction."
-            )
+        if features is None:
+            if not self._is_image_set:
+                raise RuntimeError(
+                    "An image must be set with .set_image(...) before mask prediction."
+                )
 
         if point_coords is not None:
             concat_points = (point_coords, point_labels)
@@ -413,12 +463,19 @@ class SAM2ImagePredictor:
         batched_mode = (
             concat_points is not None and concat_points[0].shape[0] > 1
         )  # multi object prediction
-        high_res_features = [
-            feat_level[img_idx].unsqueeze(0)
-            for feat_level in self._features["high_res_feats"]
-        ]
+        if features is not None:
+            high_res_features = [
+                feat_level[img_idx].unsqueeze(0)
+                for feat_level in features["high_res_feats"]
+            ]
+        else:   
+            high_res_features = [
+                feat_level[img_idx].unsqueeze(0)
+                for feat_level in self._features["high_res_feats"]
+            ]
+        embeddding = self._features["image_embed"] if features is None else features["image_embed"]
         low_res_masks, iou_predictions, _, _ = self.model.sam_mask_decoder(
-            image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
+            image_embeddings=embeddding[img_idx].unsqueeze(0),
             image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
             dense_prompt_embeddings=dense_embeddings,
@@ -428,9 +485,9 @@ class SAM2ImagePredictor:
         )
 
         # Upscale the masks to the original image resolution
-        masks = self._transforms.postprocess_masks(
-            low_res_masks, self._orig_hw[img_idx]
-        )
+        if orig_hw is None:
+            orig_hw = self._orig_hw[img_idx]
+        masks = self._transforms.postprocess_masks(low_res_masks, orig_hw[img_idx])
         low_res_masks = torch.clamp(low_res_masks, -32.0, 32.0)
         if not return_logits:
             masks = masks > self.mask_threshold
