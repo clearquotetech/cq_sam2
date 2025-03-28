@@ -31,7 +31,7 @@ from sam2.utils.amg import (
     uncrop_masks,
     uncrop_points,
 )
-
+import threading
 
 class SAM2AutomaticMaskGenerator:
     def __init__(
@@ -226,10 +226,11 @@ class SAM2AutomaticMaskGenerator:
         crop_boxes, layer_idxs = generate_crop_boxes(
             orig_size, self.crop_n_layers, self.crop_overlap_ratio
         )
-
+        # print(crop_boxes,layer_idxs)
         # Iterate over image crops
         data = MaskData()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
+            # print(crop_box,layer_idx)
             crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
             data.cat(crop_data)
 
@@ -259,7 +260,8 @@ class SAM2AutomaticMaskGenerator:
         x0, y0, x1, y1 = crop_box
         cropped_im = image[y0:y1, x0:x1, :]
         cropped_im_size = cropped_im.shape[:2]
-        self.predictor.set_image(cropped_im)
+        # self.predictor.set_image(cropped_im)
+        orig_hw,features = self.predictor.get_features(cropped_im)
 
         # Get points for this crop
         points_scale = np.array(cropped_im_size)[None, ::-1]
@@ -269,13 +271,14 @@ class SAM2AutomaticMaskGenerator:
         data = MaskData()
         for (points,) in batch_iterator(self.points_per_batch, points_for_image):
             batch_data = self._process_batch(
-                points, cropped_im_size, crop_box, orig_size, normalize=True
+                points, cropped_im_size, crop_box, orig_size, normalize=True,
+                orig_hw=orig_hw,features=features
             )
             data.cat(batch_data)
             del batch_data
-        self.predictor.reset_predictor()
+        # self.predictor.reset_predictor()
 
-        # Remove duplicates within this crop.
+    # Remove duplicates within this crop.
         keep_by_nms = batched_nms(
             data["boxes"].float(),
             data["iou_preds"],
@@ -298,6 +301,8 @@ class SAM2AutomaticMaskGenerator:
         crop_box: List[int],
         orig_size: Tuple[int, ...],
         normalize=False,
+        orig_hw=None,
+        features=None
     ) -> MaskData:
         orig_h, orig_w = orig_size
 
@@ -311,11 +316,14 @@ class SAM2AutomaticMaskGenerator:
         in_labels = torch.ones(
             in_points.shape[0], dtype=torch.int, device=in_points.device
         )
+
         masks, iou_preds, low_res_masks = self.predictor._predict(
-            in_points[:, None, :],
-            in_labels[:, None],
+            point_coords=in_points[:, None, :],
+            point_labels=in_labels[:, None],
             multimask_output=self.multimask_output,
             return_logits=True,
+            features=features,
+            orig_hw=orig_hw
         )
 
         # Serialize predictions and store in MaskData
